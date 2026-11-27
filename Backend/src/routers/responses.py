@@ -21,7 +21,24 @@ router = APIRouter()
 #GET /responses/{id}/answers.
 #GET /responses
 def build_answers(resp: Response, qv: QuestionnaireVersion, api_key:ApiKey) -> dict:
-    """Builds an 'Answers' object, for the data provided"""
+    
+    """Build one `Answers` object, as defined in the API spec.
+
+    Combines the response row with the questionnaire version it was started
+    with (for id, name, version and hash) and the API key that started it
+    (for `source`). The stored `answers` list is passed through unchanged, so
+    it must already match the `Answer` schema. Used by both
+    `GET /responses/{id}/answers` and `GET /responses`, so the two always
+    return the same structure.
+
+    Args:
+        resp: The response row.
+        qv: The exact questionnaire version the response belongs to.
+        api_key: The API key row referenced by `resp.api_key_id`.
+
+    Returns:
+        A dict that validates against the `Answers` schema.
+    """
 
     return {
         "response_id": str(resp.id),
@@ -44,18 +61,22 @@ def build_answers(resp: Response, qv: QuestionnaireVersion, api_key:ApiKey) -> d
 #GET /responses/{id}/answers
 #GET /responses/{id}/events
 def get_response_or_404(db: Session, id: str) -> Response:
-    """
+
+    """Load a response by its id, or raise 404 if there is no such response.
+
+    The id arrives from the URL as a string. A value that is not a valid UUID
+    cannot exist in the database, so it is treated the same as a missing
+    response and also gives 404 (not FastAPI's 422).
 
     Args:
-        db (Session): database connection (dependency injection)
-        id (str): String, the function checks its format to match UUID syntax
-
-    Raises:
-        HTTPException: 404, if the UUID format is incorrect
-        HTTPException: 404, if the ID doesn't exist in the database
+        db: Database session.
+        id: The response_id from the URL path.
 
     Returns:
-        Response: returns the element the given ID points to
+        The matching Response row.
+
+    Raises:
+        HTTPException: 404 if the id is malformed or no response has it.
     """
     try:
         rid = uuid.UUID(id)
@@ -70,14 +91,49 @@ def get_response_or_404(db: Session, id: str) -> Response:
 
 #region endpoints
 
-@router.post("/responses/{questionnaire_id}", response_model=StartResponseResult)
-async def submit_response(
+R400 = {400: {"description": "Bad request"}}
+R401 = {401: {"description": "Missing or invalid API key"}}
+R404 = {404: {"description": "Response not found"}}
+
+@router.post("/responses/{questionnaire_id}",
+            response_model=StartResponseResult,
+            status_code=201,
+            responses={**R400, **R401,
+                        404:{"description": "Questionnaire not found"}
+                    })
+def submit_response(
     questionnaire_id: Annotated[str, Path(pattern=r"^[a-z0-9_]+$")],
     response_data: StartResponseRequest, 
     db=Depends(get_db),
-    key: ApiKey = Depends(verify_api_key)
-    ):
-    """Logic to begin the session for the form given in the URL path"""
+    key: ApiKey = Depends(verify_api_key)):
+
+    """Start a new response for the questionnaire given in the URL path.
+
+    Creates a new response with status `in_progress`. If no `version` is sent,
+    the latest uploaded version of the questionnaire is used. The response is
+    tied to that exact version, and to the API key that started it. This
+    endpoint only ever inserts a new row and never changes an existing
+    response.
+
+    Args:
+        questionnaire_id: The questionnaire's id, from the `GET /questionnaires` list.
+        response_data: Participant pseudonym, language, occasion and the
+            optional version, session_ref, group_ref and cycle_number.
+        db: Database session (injected).
+        key: The API key row of the caller (injected), stored as the
+            source of the response.
+
+    Returns:
+        The new response_id, its status, and the display_url where the
+        questionnaire opens on the participant's screen.
+
+    Raises:
+        HTTPException: 404 if the questionnaire or the requested version
+            does not exist.
+        HTTPException: 400 if the language is not available for the
+            questionnaire, or if `occasion` is `between_cycles` and no
+            `cycle_number` is given.
+    """
 
 
     #Finding the requested version, or the latest one if none was provided
@@ -90,6 +146,11 @@ async def submit_response(
 
     if qv is None:
         raise HTTPException(404, "Questionnaire or version not found")
+
+    if response_data.language not in qv.languages:
+        raise HTTPException(400, f"Language '{response_data.language}' is not available")
+    if response_data.occasion == "between_cycles" and response_data.cycle_number is None:
+        raise HTTPException(400, "cycle_number is required for between_cycles")
 
     resp = Response(
         questionnaire_id=qv.questionnaire_id,
@@ -115,12 +176,29 @@ async def submit_response(
         }
 
 
-@router.get("/responses",response_model=GroupResponses)
-async def get_responses(
+@router.get("/responses",
+            response_model=GroupResponses,
+            responses={**R400, **R401})
+def get_responses(
     group_ref: Annotated[str, Query()],
-    db=Depends(get_db),
-    ):
-    """Logic to retrieve all the answers for a specific group reference from the database"""
+    db=Depends(get_db)):
+
+    """Return all responses that were started with the given group_ref.
+
+    Every questionnaire in the group is included, and so is every status
+    (`in_progress`, `completed` and `aborted`). Each item has the same
+    structure as the result of `GET /responses/{id}/answers`. The list is
+    ordered by start time. A group with no responses returns an empty list,
+    not an error.
+
+    Args:
+        group_ref: The grouping label the responses were started with. For
+            the Experiment module this is the ethics permit number.
+        db: Database session (injected).
+
+    Returns:
+        The group_ref and the list of responses in that group.
+    """
 
     stmt = (
         select(Response, QuestionnaireVersion, ApiKey)
@@ -145,11 +223,30 @@ async def get_responses(
     }
 
 
-@router.get("/responses/{id}", response_model=ResponseStatus)
-async def get_response_by_id(
+@router.get("/responses/{id}",
+            response_model=ResponseStatus,
+            responses={**R401, **R404})
+def get_response_by_id(
     id: str,
     db=Depends(get_db)):
-    """Logic to retrieve the status of a session from its ID"""
+
+    """Return the current status of a response.
+
+    Reports whether the response is `in_progress`, `completed` or `aborted`,
+    when it started, and when it ended. `ended_at` is `null` while the
+    response is still running.
+
+    Args:
+        id: The response_id returned when the response was started.
+        db: Database session (injected).
+
+    Returns:
+        The response's id, status, start time and end time (UTC).
+
+    Raises:
+        HTTPException: 404 if the response does not exist, or if the id is
+            not a valid UUID.
+    """
 
     resp = get_response_or_404(db, id)
     return {
@@ -160,9 +257,30 @@ async def get_response_by_id(
     }
 
 
-@router.get("/responses/{id}/answers", response_model=Answers)
-async def get_answers(id: str, db: Session = Depends(get_db)):
-    """Logic to retrieve the answers of a session from its ID"""
+@router.get("/responses/{id}/answers",
+            response_model=Answers,
+            responses={**R401, **R404})
+def get_answers(
+    id: str,
+    db: Session = Depends(get_db)):
+    
+    """Return all answers of a response.
+
+    The result includes the exact questionnaire version that was filled in
+    (id, name, version, hash), the name of the API key that started the
+    response (`source`), and the answers given so far. A response that is
+    still running, or has no answers yet, returns an empty `answers` list.
+
+    Args:
+        id: The response_id returned when the response was started.
+        db: Database session (injected).
+
+    Returns:
+        The same structure as one item of `GET /responses`.
+
+    Raises:
+        HTTPException: 404 if the response does not exist.
+    """
 
     resp = get_response_or_404(db, id)
     qv = db.get(QuestionnaireVersion, (resp.questionnaire_id, resp.version))
@@ -171,9 +289,32 @@ async def get_answers(id: str, db: Session = Depends(get_db)):
     return build_answers(resp, qv, api_key)
 
 
-@router.post("/responses/{id}/abort", response_model=ResponseStatus)
-async def abort_response(id: str, db: Session = Depends(get_db)):
-    """Logic to abort a session given its ID"""
+@router.post("/responses/{id}/abort",
+            response_model=ResponseStatus,
+            responses={**R401, **R404,
+                        409:{"description": "Response already completed or aborted"}
+                    })
+def abort_response(
+    id: str,
+    db: Session = Depends(get_db)):
+    
+    """Abort a running response.
+
+    Sets the status to `aborted` and records the end time. Answers that were
+    already given are kept. Only responses that are still `in_progress` can
+    change: aborting an already aborted response or a completed response is never modified.
+
+    Args:
+        id: The response_id returned when the response was started.
+        db: Database session (injected).
+
+    Returns:
+        The response's status after the call, including `ended_at`.
+
+    Raises:
+        HTTPException: 404 if the response does not exist.
+        HTTPException: 409 if the response is already completed or aborted.
+    """
 
     resp = get_response_or_404(db, id)
 
@@ -196,9 +337,25 @@ async def abort_response(id: str, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/responses/{id}/events", response_model=list[Event])
-async def get_events(id: str, db: Session = Depends(get_db)):
-    """Logic to retrieve the events and their timestamps of a session from its ID"""
+@router.get("/responses/{id}/events",
+            response_model=list[Event],
+            responses={**R401, **R404})
+def get_events(
+    id: str,
+    db: Session = Depends(get_db)):
+
+    """Return the events of a response in chronological order.
+
+    Events are sorted by UTC time, with the monotonic clock as a tiebreaker.
+    A response with no events returns an empty list.
+
+    Args:
+        id: The response_id returned when the response was started.
+        db: Database session (injected).
+
+    Raises:
+        HTTPException: 404 if the response does not exist.
+    """
     resp = get_response_or_404(db, id)
 
     rows = db.scalars(
