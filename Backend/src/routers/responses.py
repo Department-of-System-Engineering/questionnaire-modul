@@ -1,20 +1,20 @@
 import secrets
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func, update
 from sqlalchemy.orm import Session
 from typing import Annotated
 
 from ..auth import verify_api_key
-from ..models.schemas import StartResponseResult, StartResponseRequest, GroupResponses, ResponseStatus, Answers
+from ..models.schemas import StartResponseResult, StartResponseRequest, GroupResponses, ResponseStatus, Answers, Event
 from ..models.response import Response
 from ..models.questionnaire_versions import QuestionnaireVersion
 from ..models.api_key import ApiKey
+from ..models.response_event import ResponseEvent
 from ..database import get_db
+from config import settings
 
 router = APIRouter()
-
-BASE_URL = "http://localhost:8080"
 
 #region helpers
 
@@ -44,6 +44,19 @@ def build_answers(resp: Response, qv: QuestionnaireVersion, api_key:ApiKey) -> d
 #GET /responses/{id}/answers
 #GET /responses/{id}/events
 def get_response_or_404(db: Session, id: str) -> Response:
+    """
+
+    Args:
+        db (Session): database connection (dependency injection)
+        id (str): String, the function checks its format to match UUID syntax
+
+    Raises:
+        HTTPException: 404, if the UUID format is incorrect
+        HTTPException: 404, if the ID doesn't exist in the database
+
+    Returns:
+        Response: returns the element the given ID points to
+    """
     try:
         rid = uuid.UUID(id)
     except ValueError:
@@ -98,7 +111,7 @@ async def submit_response(
     return {
         "response_id": str(resp.id),
         "status": resp.status,
-        "display_url": f"{BASE_URL}/r/{resp.id}",
+        "display_url": f"{settings.base_url}/r/{resp.id}",
         }
 
 
@@ -161,16 +174,47 @@ async def get_answers(id: str, db: Session = Depends(get_db)):
 @router.post("/responses/{id}/abort", response_model=ResponseStatus)
 async def abort_response(id: str, db: Session = Depends(get_db)):
     """Logic to abort a session given its ID"""
-    
 
-    
-    return {}
+    resp = get_response_or_404(db, id)
+
+    result = db.execute(
+        update(Response)
+        .where(Response.id == resp.id, Response.status == "in_progress")
+        .values(status="aborted", ended_at=func.now())
+    )
+    db.commit()
+    db.refresh(resp)
+
+    if result.rowcount == 0:
+        raise HTTPException(409, f"Response is already {resp.status}")
+
+    return {
+        "response_id": str(resp.id),
+        "status": resp.status,
+        "started_at": resp.started_at,
+        "ended_at": resp.ended_at
+    }
 
 
-@router.get("/responses/{id}/events")
-async def get_events(id: int, db=Depends(get_db)):
+@router.get("/responses/{id}/events", response_model=list[Event])
+async def get_events(id: str, db: Session = Depends(get_db)):
     """Logic to retrieve the events and their timestamps of a session from its ID"""
+    resp = get_response_or_404(db, id)
+
+    rows = db.scalars(
+        select(ResponseEvent)
+        .where(ResponseEvent.response_id == resp.id)
+        .order_by(ResponseEvent.t_utc_ns, ResponseEvent.t_mono_ns)
+        ).all()
     
-    return {}
+    return [
+        {
+            "t_utc_ns": e.t_utc_ns,
+            "t_mono_ns": e.t_mono_ns,
+            "type": e.type,
+            "payload": e.payload
+        }
+        for e in rows
+    ]
 
 #endregion
