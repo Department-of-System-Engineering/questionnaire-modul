@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16
+    container_name: kerdoiv-postgres
+    environment:
+      POSTGRES_USER: kerdoiv_Admin
+      POSTGRES_PASSWORD: Admin123
+      POSTGRES_DB: kerdoiv
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./Database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./Database/seed.sql:/docker-entrypoint-initdb.d/02_seed.sql
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: kerdoiv-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@kerdoiv.com
+      PGADMIN_DEFAULT_PASSWORD: Admin123
+    ports:
+      - "8080:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:
+  pgadmin_data:
